@@ -1,0 +1,8 @@
+__pycache__/
+*.pyc
+pymap-output/
+pyscan-output/
+mysqldata/
+*.log
+*.csv
+.DS_Store
