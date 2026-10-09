@@ -64,6 +64,33 @@ MySQL/MariaDB, PostgreSQL, SQLite, MSSQL (core), Oracle (fingerprint).
 
 ## pyscan.py — find and exploit SQLi across a site
 
+### Interactive mode (easiest)
+
+Just run it with no arguments — type (or paste) any target URL and it gets scanned:
+
+```bash
+python3 pyscan.py
+```
+
+```
+Enter target URL (or 'quit'): http://target/
+Include time-based detection? slower (y/N):
+Auto-exploit findings (fingerprint, db, user)? (Y/n):
+Dump proof rows from vulnerable endpoints? (y/N):
+...
+[+] VULNERABLE: param 'id' via E
+[*] exploiting...
+[+] banner: 11.8.6-MariaDB-6 from Debian
+[+] current database: shopdb
+
+Enter target URL (or 'quit'):
+```
+
+Loops until you type `quit`. Every request is logged to `pyscan-output/evidence.jsonl`,
+findings to `pyscan-output/report.json`. `http://` is added automatically if omitted.
+
+### Command-line mode
+
 ```bash
 # crawl + scan only (fast: UEB techniques)
 python3 pyscan.py --url http://target/

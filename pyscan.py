@@ -204,12 +204,138 @@ def exploit_candidate(pm, opts):
     return out
 
 
+# ---------------------------------------------------------------- scan loop + report
+def scan_candidates(opts, candidates, session_results):
+    """Scan every candidate endpoint; append findings to session_results."""
+    for i, cand in enumerate(candidates, 1):
+        url = cand["url"] + ("?" + cand["qs"] if cand["qs"] else "")
+        log(0, f"\n[{i}/{len(candidates)}] scanning {cand['method']} {url}"
+               + (f" data={cand['data']}" if cand["data"] else ""))
+        try:
+            pm = scan_candidate(cand, opts)
+        except Exception as e:
+            log(1, f"    [-] scan error: {e}")
+            pm = None
+        if not pm:
+            log(0, "    [-] not vulnerable")
+            continue
+        inj = pm.injectables[0]
+        log(0, f"    [+] VULNERABLE: param '{inj.param}' via {','.join(inj.techniques)}")
+        row = {"url": url, "method": cand["method"], "data": cand["data"],
+               "param": inj.param, "location": inj.location,
+               "context": inj.context.name,
+               "techniques": list(inj.techniques.keys())}
+        if opts.exploit:
+            log(0, "    [*] exploiting...")
+            row["exploit"] = exploit_candidate(pm, opts)
+        session_results.append(row)
+    return session_results
+
+
+def write_report(opts, session_results, total_scanned, start_urls):
+    print("\n" + "=" * 70)
+    log(0, f"SCAN COMPLETE: {len(session_results)}/{total_scanned} endpoints vulnerable\n")
+    if session_results:
+        print_table(["#", "method", "url", "param", "techniques", "dbms"],
+                    [[i + 1, r["method"], r["url"][:44], r["param"],
+                      ",".join(r["techniques"]),
+                      (r.get("exploit") or {}).get("dbms", "-")]
+                     for i, r in enumerate(session_results)])
+    os.makedirs(opts.output_dir, exist_ok=True)
+    out = {"scan": datetime.now(timezone.utc).isoformat(),
+           "start_urls": start_urls, "candidates": total_scanned,
+           "vulnerable": session_results}
+    path = os.path.join(opts.output_dir, "report.json")
+    with open(path, "w") as f:
+        json.dump(out, f, indent=2)
+    with open(os.path.join(opts.output_dir, "evidence.jsonl"), "w") as f:
+        for row in pymap._EVIDENCE:
+            f.write(json.dumps(row) + "\n")
+    log(0, f"[*] report: {path}")
+
+
+# ---------------------------------------------------------------- interactive mode
+def ask(prompt, default="n"):
+    try:
+        a = input(prompt).strip().lower()
+    except EOFError:
+        a = ""
+    return a if a else default
+
+
+def interactive(opts):
+    """Interactive mode: user enters target URLs, each is crawled, scanned for
+    SQL injection and (optionally) exploited. Loops until 'quit'."""
+    print(pymap.BANNER)
+    print("[*] INTERACTIVE MODE - enter a target URL and it will be scanned for SQL injection")
+    print("    (type 'quit' to exit)\n")
+    session_results, total_scanned, start_urls = [], 0, []
+
+    while True:
+        try:
+            url = input("Enter target URL (or 'quit'): ").strip()
+        except (EOFError, KeyboardInterrupt):
+            print()
+            break
+        if not url:
+            continue
+        if url.lower() in ("quit", "exit", "q", "stop"):
+            break
+        if "://" not in url:
+            url = "http://" + url
+        try:
+            urllib.parse.urlsplit(url)
+        except ValueError:
+            log(0, "[!] invalid URL, try again")
+            continue
+
+        # per-target quick options (defaults chosen for speed)
+        inc_t = ask("Include time-based detection? slower (y/N): ", "n")
+        do_exploit = ask("Auto-exploit findings (fingerprint, db, user)? (Y/n): ", "y")
+        do_dump = ask("Dump proof rows from vulnerable endpoints? (y/N): ", "n")
+        o = argparse.Namespace(**vars(opts))
+        o.technique = opts.technique + ("T" if "T" not in opts.technique else "") \
+            if inc_t == "y" else opts.technique
+        o.exploit = do_exploit == "y"
+        o.auto_dump = do_dump == "y"
+
+        log(0, f"\n[*] crawling {url} (max {o.max_pages} pages)...")
+        try:
+            candidates = crawl(url, o.max_pages, o.crawl_delay,
+                               o.user_agent, o.timeout)
+        except Exception as e:
+            log(0, f"[!] crawl failed: {e}")
+            continue
+        log(0, f"[+] crawl done: {len(candidates)} unique parameterized endpoints")
+        for c in candidates:
+            log(1, f"    {c['method']} {c['url']}{'?' + c['qs'] if c['qs'] else ''} "
+                   f"{'data=' + c['data'] if c['data'] else ''} ({c['note']})")
+        if not candidates:
+            log(0, "[!] no parameterized endpoints found on this target")
+            continue
+
+        total_scanned += len(candidates)
+        start_urls.append(url)
+        scan_candidates(o, candidates, session_results)
+        write_report(o, session_results, total_scanned, start_urls)
+        log(0, "\n[*] scan finished. Enter another URL or 'quit'.")
+
+    if total_scanned:
+        write_report(opts, session_results, total_scanned, start_urls)
+    else:
+        log(0, "[*] no targets scanned.")
+    return 0
+
+
 # ---------------------------------------------------------------- main
 def main():
     ap = argparse.ArgumentParser(prog="pyscan",
                                 description="find SQLi across a website and exploit it")
     ap.add_argument("--url", help="start URL to crawl")
     ap.add_argument("-l", "--list", help="file with URLs to scan (no crawling)")
+    ap.add_argument("-i", "--interactive", action="store_true",
+                    help="interactive mode: enter target URLs to scan (default when no "
+                         "--url/-l given)")
     ap.add_argument("--max-pages", type=int, default=25, help="crawl page limit (default 25)")
     ap.add_argument("--crawl-delay", type=float, default=0.2, help="politeness delay")
     ap.add_argument("--delay", type=float, default=0, help="delay between test requests")
@@ -234,6 +360,10 @@ def main():
     pymap.VERBOSE = opts.verbose
     opts.technique = opts.technique.upper()
 
+    # interactive mode: no --url / -l given, or -i requested
+    if opts.interactive or (not opts.url and not opts.list):
+        return interactive(opts)
+
     print(pymap.BANNER)
     log(0, f"[*] pyscan starting at {datetime.now(timezone.utc).isoformat()}")
 
@@ -246,7 +376,7 @@ def main():
         for c in candidates:
             log(1, f"    {c['method']} {c['url']}{'?' + c['qs'] if c['qs'] else ''} "
                    f"{'data=' + c['data'] if c['data'] else ''} ({c['note']})")
-    elif opts.list:
+    else:
         with open(opts.list) as f:
             candidates = []
             for line in f:
@@ -257,56 +387,15 @@ def main():
                 candidates.append({"url": f"{u.scheme}://{u.netloc}{u.path}",
                                    "qs": u.query, "method": "GET", "data": None,
                                    "note": "list"})
-    else:
-        ap.error("need --url or -l <file>")
 
     if not candidates:
         log(0, "[!] no parameterized endpoints found")
         return 1
 
-    # ---- 2. scan + 3. exploit
-    os.makedirs(opts.output_dir, exist_ok=True)
+    # ---- 2. scan + 3. exploit + report
     results = []
-    for i, cand in enumerate(candidates, 1):
-        url = cand["url"] + ("?" + cand["qs"] if cand["qs"] else "")
-        log(0, f"\n[{i}/{len(candidates)}] scanning {cand['method']} {url}"
-               + (f" data={cand['data']}" if cand["data"] else ""))
-        try:
-            pm = scan_candidate(cand, opts)
-        except Exception as e:
-            log(1, f"    [-] scan error: {e}")
-            pm = None
-        if not pm:
-            log(0, "    [-] not vulnerable")
-            continue
-        inj = pm.injectables[0]
-        log(0, f"    [+] VULNERABLE: param '{inj.param}' via {','.join(inj.techniques)}")
-        row = {"url": url, "method": cand["method"], "data": cand["data"],
-               "param": inj.param, "location": inj.location,
-               "context": inj.context.name,
-               "techniques": list(inj.techniques.keys())}
-        if opts.exploit:
-            log(0, "    [*] exploiting...")
-            row["exploit"] = exploit_candidate(pm, opts)
-        results.append(row)
-
-    # ---- report
-    print("\n" + "=" * 70)
-    log(0, f"SCAN COMPLETE: {len(results)}/{len(candidates)} endpoints vulnerable\n")
-    if results:
-        print_table(["#", "method", "url", "param", "techniques", "dbms"],
-                    [[i + 1, r["method"], r["url"][:44], r["param"],
-                      ",".join(r["techniques"]),
-                      (r.get("exploit") or {}).get("dbms", "-")] for i, r in enumerate(results)])
-    out = {"scan": datetime.now(timezone.utc).isoformat(),
-           "start_url": opts.url, "candidates": len(candidates), "vulnerable": results}
-    path = os.path.join(opts.output_dir, "report.json")
-    with open(path, "w") as f:
-        json.dump(out, f, indent=2)
-    with open(os.path.join(opts.output_dir, "evidence.jsonl"), "w") as f:
-        for row in pymap._EVIDENCE:
-            f.write(json.dumps(row) + "\n")
-    log(0, f"[*] report: {path}")
+    scan_candidates(opts, candidates, results)
+    write_report(opts, results, len(candidates), [opts.url])
     return 0
 
 
