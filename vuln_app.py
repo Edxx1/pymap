@@ -53,7 +53,7 @@ def index():
 <li><a href="/search?q=widget">search?q=widget</a></li>
 <li><a href="/account">account (cookie uid=1)</a></li>
 </ul>
-<form method="POST" action="/login"><input name="username" value="alice">
+<form method="POST" action="/login"><input type="hidden" name="csrf_token" value="abc123"><input name="username" value="alice">
 <input name="password" value="x"><button>login</button></form>
 """
 

